@@ -4407,9 +4407,9 @@ def attn_forward_func_with_cp(
         if get_distributed_world_size(cp_group[0]) == 1:
             cp_group = cp_group[1]
             cp_comm_type = "p2p"
-        elif get_distributed_world_size(cp_group[1]) == 1:
-            cp_group = cp_group[0]
-            cp_comm_type = "a2a"
+        # elif get_distributed_world_size(cp_group[1]) == 1:
+        #     cp_group = cp_group[0]
+        #     cp_comm_type = "a2a"
     else:
         assert isinstance(
             cp_group, dist_group_type

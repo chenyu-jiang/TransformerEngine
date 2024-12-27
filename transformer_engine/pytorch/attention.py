@@ -1574,6 +1574,95 @@ def reorder_seq_chunks_for_a2a(x, chunk_ids_for_a2a, seq_dim, cp_size, before_at
         x = x.view(cp_size, 2, *x.shape[1:])
     return x
 
+def reorder_seq_chunks_for_a2a_varlen(x, chunk_ids_for_a2a, local_cu_seqlens_cpu, cp_size, before_attn):
+    if before_attn:
+        # [cp, t, np//cp, hn]
+        # print("[RANK {}] x shape: {}, local_cu_seqlens_cpu: {}".format(torch.distributed.get_rank(), x.shape, local_cu_seqlens_cpu))
+        results = []
+        for i in range(1, len(local_cu_seqlens_cpu)):
+            seq_i_start = local_cu_seqlens_cpu[i - 1]
+            seq_i_end = local_cu_seqlens_cpu[i]
+            x_i = x[:, seq_i_start:seq_i_end] # [cp, s, np//cp, hn]
+            # print("[RANK {}] x_i shape: {}".format(torch.distributed.get_rank(), x_i.shape))
+            x_i = x_i.reshape(cp_size * 2, -1, *x_i.shape[2:]) # [cp * 2, s//2, np//cp, hn]
+            # reorder the sequence chunks
+            x_i = torch.index_select(x_i, dim=0, index=chunk_ids_for_a2a).view(-1, *x_i.shape[2:]) # [cp * s, np//cp, hn]
+            results.append(x_i)
+        x = torch.cat(results, dim=0) # [t * cp, np//cp, hn]
+    else:
+        # [cp * t, np//cp, hn]
+        results = []
+        for i in range(1, len(local_cu_seqlens_cpu)):
+            seq_i_start = local_cu_seqlens_cpu[i - 1] * cp_size
+            seq_i_end = local_cu_seqlens_cpu[i] * cp_size
+            x_i = x[seq_i_start:seq_i_end] # [cp * s, np//cp, hn]
+            x_i = x_i.view(cp_size * 2, -1, *x_i.shape[1:]) # [cp * 2, s//2, np//cp, hn]
+            # reorder the sequence chunks
+            x_i = torch.index_select(x_i, dim=0, index=chunk_ids_for_a2a).view(cp_size, -1, *x_i.shape[2:]) # [cp, s, np//cp, hn]
+            results.append(x_i)
+        x = torch.cat(results, dim=1) # [cp, t, np//cp, hn]
+    return x
+
+def flash_attn_a2a_communicate_thd(
+    a2a_inputs: Union[torch.Tensor, List[torch.Tensor]],
+    chunk_ids_for_a2a: torch.Tensor,
+    local_cu_seqlens: torch.Tensor,
+    cp_size: int,
+    cp_group: dist_group_type,
+    cp_stream: torch.cuda.Stream,
+    before_attn: bool,
+) -> Union[torch.Tensor, List[torch.Tensor]]:
+    """A2A communication for context parallelism."""
+    a2a_inputs = [a2a_inputs] if not isinstance(a2a_inputs, list) else a2a_inputs
+    a2a_outputs, a2a_reqs = [None] * len(a2a_inputs), [None] * len(a2a_inputs)
+    if before_attn:
+        for i in range(len(a2a_inputs) + 2):
+            if 0 < i < len(a2a_inputs) + 1:
+                a2a_outputs[i - 1] = torch.empty_like(a2a_inputs[i - 1])
+                a2a_reqs[i - 1] = torch.distributed.all_to_all_single(
+                    a2a_outputs[i - 1], a2a_inputs[i - 1], group=cp_group, async_op=True
+                )
+            if i > 1:
+                with torch.cuda.stream(cp_stream):
+                    a2a_reqs[i - 2].wait()
+                    x = a2a_outputs[i - 2]
+                    # reorder the sequence chunks
+                    x = reorder_seq_chunks_for_a2a_varlen(
+                        x, chunk_ids_for_a2a, local_cu_seqlens, cp_size, before_attn
+                    )
+                    a2a_outputs[i - 2] = x # [t * cp, np // cp, hn]
+            if i < len(a2a_inputs):
+                x = a2a_inputs[i]
+                # [t, np, hn] -> [t, cp, np//cp, hn]
+                x = x.view(*x.shape[:-2], cp_size, x.shape[-2] // cp_size, x.shape[-1])
+                # [t, cp, np//cp, hn] -> [cp, t, np//cp, hn]
+                a2a_inputs[i] = x.movedim(-3, 0).contiguous()
+    else:
+        for i in range(len(a2a_inputs) + 2):
+            if 0 < i < len(a2a_inputs) + 1:
+                a2a_outputs[i - 1] = torch.empty_like(a2a_inputs[i - 1])
+                a2a_reqs[i - 1] = torch.distributed.all_to_all_single(
+                    a2a_outputs[i - 1], a2a_inputs[i - 1], group=cp_group, async_op=True
+                )
+            if i < len(a2a_inputs):
+                x = a2a_inputs[i]
+                # [cp * t, np//cp, hn] -> [b, cp*2, s//2, np//cp, hn]
+                # or [cp*s, b, np//cp, hn] -> [cp*2, s//2, b, np//cp, hn]
+                # reorder the sequence chunks
+                a2a_inputs[i] = reorder_seq_chunks_for_a2a_varlen(
+                    x, chunk_ids_for_a2a, local_cu_seqlens, cp_size, before_attn
+                ) # [cp, t, np//cp, hn]
+            if i > 1:
+                with torch.cuda.stream(cp_stream):
+                    a2a_reqs[i - 2].wait()
+                    x = a2a_outputs[i - 2]
+                    # [cp, t, np//cp, hn] -> [t, cp, np//cp, hn]
+                    x = x.movedim(0, -3).contiguous()
+                    # [t, cp, np//cp, hn] -> [t, np, hn]
+                    a2a_outputs[i - 2] = x.view(-1, x.shape[-3] * x.shape[-2], x.shape[-1])
+    torch.cuda.current_stream().wait_stream(cp_stream)
+    return a2a_outputs[0] if len(a2a_inputs) == 1 else a2a_outputs
+
 
 def flash_attn_a2a_communicate(
     a2a_inputs: Union[torch.Tensor, List[torch.Tensor]],
@@ -1687,9 +1776,9 @@ class AttnFuncWithCPAndKVP2P(torch.autograd.Function):
             softmax_scale = q.shape[-1] ** (-0.5)
 
         if isinstance(cp_group, list):
-            assert (
-                qkv_format != "thd"
-            ), f"{qkv_format} format is not supported with hierarchical CP implementation yet!"
+            # assert (
+            #     qkv_format != "thd"
+            # ), f"{qkv_format} format is not supported with hierarchical CP implementation yet!"
             assert attn_bias_type == "no_bias", (
                 f"{attn_bias_type} bias type is not supported with hierarchical CP implementation"
                 " yet!"
@@ -1727,6 +1816,9 @@ class AttnFuncWithCPAndKVP2P(torch.autograd.Function):
         cu_seqlens_kv_padded = cu_seqlens_kv_padded // cp_size
         cu_seqlens_q_per_step = [None for _ in range(cp_size)]
         cu_seqlens_kv_per_step = [None for _ in range(cp_size)]
+
+        if cp_size_a2a > 1 and qkv_format == "thd":
+            cu_seqlens_q_local_padded_cpu = (cu_seqlens_q_padded // cp_size_a2a).cpu()
 
         fused_attn_qkv_dtype = None
         fused_attn_backend = None
@@ -1778,9 +1870,14 @@ class AttnFuncWithCPAndKVP2P(torch.autograd.Function):
 
         if cp_size_a2a > 1:
             chunk_ids_for_a2a = get_seq_chunk_ids_for_reordering(cp_size_a2a, q.device, True)
-            q, k, v = flash_attn_a2a_communicate(
-                [q, k, v], chunk_ids_for_a2a, seq_dim, cp_size_a2a, cp_group_a2a, cp_stream, True
-            )
+            if qkv_format == "thd":
+                q, k, v = flash_attn_a2a_communicate_thd(
+                    [q, k, v], chunk_ids_for_a2a, cu_seqlens_q_local_padded_cpu, cp_size_a2a, cp_group_a2a, cp_stream, True
+                )
+            else:
+                q, k, v = flash_attn_a2a_communicate(
+                    [q, k, v], chunk_ids_for_a2a, seq_dim, cp_size_a2a, cp_group_a2a, cp_stream, True
+                )
             if not fp8:
                 q_f16 = q
             elif not is_input_fp8 and not int(os.getenv("NVTE_FP8_DPA_BWD", "1")):
@@ -2418,9 +2515,14 @@ class AttnFuncWithCPAndKVP2P(torch.autograd.Function):
 
         if cp_size_a2a > 1:
             chunk_ids_for_a2a = get_seq_chunk_ids_for_reordering(cp_size_a2a, out.device, False)
-            out = flash_attn_a2a_communicate(
-                out, chunk_ids_for_a2a, seq_dim, cp_size_a2a, cp_group_a2a, cp_stream, False
-            )
+            if qkv_format == "thd":
+                out = flash_attn_a2a_communicate_thd(
+                    out, chunk_ids_for_a2a, cu_seqlens_q_local_padded_cpu, cp_size_a2a, cp_group_a2a, cp_stream, False
+                )
+            else:
+                out = flash_attn_a2a_communicate(
+                    out, chunk_ids_for_a2a, seq_dim, cp_size_a2a, cp_group_a2a, cp_stream, False
+                )
             if use_fused_attention:
                 if qkv_format == "bshd":
                     # [b*s, np, hn] -> [b, s, np, hn]

@@ -1819,6 +1819,7 @@ class AttnFuncWithCPAndKVP2P(torch.autograd.Function):
 
         if cp_size_a2a > 1 and qkv_format == "thd":
             cu_seqlens_q_local_padded_cpu = (cu_seqlens_q_padded // cp_size_a2a).cpu()
+            ctx.cu_seqlens_q_local_padded_cpu = cu_seqlens_q_local_padded_cpu
 
         fused_attn_qkv_dtype = None
         fused_attn_backend = None
@@ -2746,19 +2747,30 @@ class AttnFuncWithCPAndKVP2P(torch.autograd.Function):
                 fused_attn_backend = FusedAttnBackend["F16_arbitrary_seqlen"]
 
         if cp_size_a2a > 1:
-            if not ctx.use_fused_attention:
+            if not ctx.use_fused_attention and ctx.qkv_format != "thd":
                 out = out.view(ctx.batch_size, -1, *out.shape[-2:])
                 dout = dout.view(*out.shape)
             chunk_ids_for_a2a = get_seq_chunk_ids_for_reordering(cp_size_a2a, out.device, True)
-            out, dout = flash_attn_a2a_communicate(
-                [out, dout],
-                chunk_ids_for_a2a,
-                seq_dim,
-                cp_size_a2a,
-                ctx.cp_group_a2a,
-                ctx.cp_stream,
-                True,
-            )
+            if ctx.qkv_format == "thd":
+                out, dout = flash_attn_a2a_communicate_thd(
+                    [out, dout],
+                    chunk_ids_for_a2a,
+                    ctx.cu_seqlens_q_local_padded_cpu,
+                    cp_size_a2a,
+                    ctx.cp_group_a2a,
+                    ctx.cp_stream,
+                    True,
+                )
+            else:
+                out, dout = flash_attn_a2a_communicate(
+                    [out, dout],
+                    chunk_ids_for_a2a,
+                    seq_dim,
+                    cp_size_a2a,
+                    ctx.cp_group_a2a,
+                    ctx.cp_stream,
+                    True,
+                )
             if not ctx.fp8 and ctx.fp8_meta is not None and ctx.is_output_fp8:
                 dout = cast_from_fp8(
                     dout,
@@ -3383,15 +3395,26 @@ class AttnFuncWithCPAndKVP2P(torch.autograd.Function):
 
         if cp_size_a2a > 1:
             chunk_ids_for_a2a = get_seq_chunk_ids_for_reordering(cp_size_a2a, q.device, False)
-            dq, dk, dv = flash_attn_a2a_communicate(
-                [dq, dk, dv],
-                chunk_ids_for_a2a,
-                seq_dim,
-                cp_size_a2a,
-                ctx.cp_group_a2a,
-                ctx.cp_stream,
-                False,
-            )
+            if ctx.qkv_format == "thd":
+                dq, dk, dv = flash_attn_a2a_communicate_thd(
+                    [dq, dk, dv],
+                    chunk_ids_for_a2a,
+                    ctx.cu_seqlens_q_local_padded_cpu,
+                    cp_size_a2a,
+                    ctx.cp_group_a2a,
+                    ctx.cp_stream,
+                    False,
+                )
+            else:
+                dq, dk, dv = flash_attn_a2a_communicate(
+                    [dq, dk, dv],
+                    chunk_ids_for_a2a,
+                    seq_dim,
+                    cp_size_a2a,
+                    ctx.cp_group_a2a,
+                    ctx.cp_stream,
+                    False,
+                )
             if ctx.qkv_format == "bshd":
                 dq, dk, dv = [x.view(ctx.batch_size, -1, *x.shape[-2:]) for x in [dq, dk, dv]]
             elif ctx.qkv_format == "sbhd":

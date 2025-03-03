@@ -1954,32 +1954,35 @@ class AttnFuncWithCPAndKVP2P(torch.autograd.Function):
         if cp_size_a2a > 1:
             chunk_ids_for_a2a = get_seq_chunk_ids_for_reordering(cp_size_a2a, q.device, True)
             if qkv_format == "thd":
-                if attn_ranges is not None:
-                    if attn_ranges.dim() == 2:
-                        attn_ranges = attn_ranges.permute(1, 0).repeat(cp_size_a2a, 1)
-                    elif attn_ranges.dim() == 3:
-                        attn_ranges = attn_ranges.permute(2, 0, 1).repeat(cp_size_a2a, 1, 1)
-                    else:
-                        raise ValueError("attn_ranges must be 2D or 3D!")
-                    q, k, v, attn_ranges = flash_attn_a2a_communicate_thd(
-                        [q, k, v, attn_ranges],
-                        chunk_ids_for_a2a,
-                        cu_seqlens_q_local_padded_cpu,
-                        cp_size_a2a,
-                        cp_group_a2a,
-                        cp_stream,
-                        True,
-                    )
-                    if attn_ranges.dim() == 2:
-                        attn_ranges = attn_ranges.permute(1, 0)
-                    elif attn_ranges.dim() == 3:
-                        attn_ranges = attn_ranges.permute(1, 2, 0)
-                    else:
-                        raise ValueError("attn_ranges must be 2D or 3D!")
-                else:
-                    q, k, v = flash_attn_a2a_communicate_thd(
-                        [q, k, v], chunk_ids_for_a2a, cu_seqlens_q_local_padded_cpu, cp_size_a2a, cp_group_a2a, cp_stream, True
-                    )
+                # if attn_ranges is not None:
+                #     print("[RANK {}] attn_ranges shape before repeat: {}".format(torch.distributed.get_rank(), attn_ranges.shape))
+                #     if attn_ranges.dim() == 2:
+                #         attn_ranges = attn_ranges.permute(1, 0).repeat(cp_size_a2a, 1)
+                #     elif attn_ranges.dim() == 3:
+                #         attn_ranges = attn_ranges.permute(2, 0, 1).repeat(cp_size_a2a, 1, 1)
+                #     else:
+                #         raise ValueError("attn_ranges must be 2D or 3D!")
+                #     print("[RANK {}] attn_ranges shape after repeat: {}".format(torch.distributed.get_rank(), attn_ranges.shape))
+                #     q, k, v, attn_ranges = flash_attn_a2a_communicate_thd(
+                #         [q, k, v, attn_ranges],
+                #         chunk_ids_for_a2a,
+                #         cu_seqlens_q_local_padded_cpu,
+                #         cp_size_a2a,
+                #         cp_group_a2a,
+                #         cp_stream,
+                #         True,
+                #     )
+                #     print("[RANK {}] attn_ranges shape after a2a: {}".format(torch.distributed.get_rank(), attn_ranges.shape))
+                #     if attn_ranges.dim() == 2:
+                #         attn_ranges = attn_ranges.permute(1, 0)
+                #     elif attn_ranges.dim() == 3:
+                #         attn_ranges = attn_ranges.permute(1, 2, 0)
+                #     else:
+                #         raise ValueError("attn_ranges must be 2D or 3D!")
+                # else:
+                q, k, v = flash_attn_a2a_communicate_thd(
+                    [q, k, v], chunk_ids_for_a2a, cu_seqlens_q_local_padded_cpu, cp_size_a2a, cp_group_a2a, cp_stream, True
+                )
             else:
                 q, k, v = flash_attn_a2a_communicate(
                     [q, k, v], chunk_ids_for_a2a, seq_dim, cp_size_a2a, cp_group_a2a, cp_stream, True

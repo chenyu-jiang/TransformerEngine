@@ -66,6 +66,7 @@ AttnMaskType = {
     "padding_causal": NVTE_Mask_Type.NVTE_PADDING_CAUSAL_MASK,
     "causal_bottom_right": NVTE_Mask_Type.NVTE_CAUSAL_BOTTOM_RIGHT_MASK,
     "padding_causal_bottom_right": NVTE_Mask_Type.NVTE_PADDING_CAUSAL_BOTTOM_RIGHT_MASK,
+    "custom_ranges": NVTE_Mask_Type.NVTE_NO_MASK,
 }
 
 FusedAttnBackend = {

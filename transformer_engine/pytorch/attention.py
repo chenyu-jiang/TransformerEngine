@@ -151,6 +151,11 @@ else:
         )
         from flash_attn_2_cuda import varlen_bwd as flash_attn_cuda_bwd
 
+        from bblock.runtime.flash_attention.executor import (
+            _wrapped_flash_attn_varlen_forward_for_te as bblock_flash_attn_varlen_fwd,
+            _wrapped_flash_attn_varlen_backward_for_te as bblock_flash_attn_varlen_bwd
+        )
+
         _flash_attn_is_installed = True
         _flash_attn_2_plus = _flash_attn_version >= PkgVersion("2")
         _flash_attn_2_1_plus = _flash_attn_version >= PkgVersion("2.1")
@@ -1499,9 +1504,20 @@ def flash_attn_fwd_softmax_lse_correction(
     softmax_lse_per_step: torch.Tensor,
 ):
     """Merge softmax stats of each step in Attention with context parallelism"""
+    # mask out -inf and inf values
+    orig_mask = torch.isfinite(softmax_lse)
+    step_mask = torch.isfinite(softmax_lse_per_step)
+    new_scale = softmax_lse.clone()
+    new_scale[orig_mask & ~step_mask] = softmax_lse[orig_mask & (~step_mask)]
+    new_scale[~orig_mask & step_mask] = (softmax_lse_per_step[~orig_mask & step_mask]).to(
+        dtype=softmax_lse.dtype)
+    new_scale.masked_fill_(~orig_mask & ~step_mask, float("inf"))
+
     max_scale = torch.max(softmax_lse, softmax_lse_per_step)
     min_scale = torch.min(softmax_lse, softmax_lse_per_step)
-    new_scale = max_scale + torch.log(1 + torch.exp(min_scale - max_scale))
+    calculated_scale = max_scale + torch.log(1 + torch.exp(min_scale - max_scale))
+    new_scale[orig_mask & step_mask] = calculated_scale[orig_mask & step_mask]
+
     softmax_lse.copy_(new_scale)
 
 
@@ -1731,6 +1747,68 @@ def flash_attn_a2a_communicate(
     torch.cuda.current_stream().wait_stream(cp_stream)
     return a2a_outputs[0] if len(a2a_inputs) == 1 else a2a_outputs
 
+def _get_local_attn_range(step_idx: int, p2p_rank: int, cp_size: int, attn_ranges: torch.Tensor, cu_seqlens: torch.Tensor, is_bw: bool = False) -> torch.Tensor:
+    n_chunks = 2 * cp_size
+    if is_bw:
+        step_idx = cp_size - step_idx - 1
+    current_step_kv_rank = (p2p_rank - step_idx + cp_size) % cp_size
+    raw_seqlens = cu_seqlens[1:] - cu_seqlens[:-1]
+    local_total_cu_seqlens = cu_seqlens // cp_size
+    chunk_size_per_seq = raw_seqlens // n_chunks
+    chunk_indices = [current_step_kv_rank, 2 * cp_size - current_step_kv_rank - 1]
+    chunk_0_starts = torch.zeros(attn_ranges.shape[-1], dtype=attn_ranges.dtype, device=attn_ranges.device)
+    chunk_0_ends = torch.zeros(attn_ranges.shape[-1], dtype=attn_ranges.dtype, device=attn_ranges.device)
+    chunk_1_starts = torch.zeros(attn_ranges.shape[-1], dtype=attn_ranges.dtype, device=attn_ranges.device)
+    chunk_1_ends = torch.zeros(attn_ranges.shape[-1], dtype=attn_ranges.dtype, device=attn_ranges.device)
+    for seq_id in range(raw_seqlens.shape[0]):
+        local_tokens_start = local_total_cu_seqlens[seq_id]
+        local_tokens_end = local_total_cu_seqlens[seq_id + 1]
+        chunk_0_starts[local_tokens_start:local_tokens_end] = chunk_size_per_seq[seq_id] * chunk_indices[0]
+        chunk_0_ends[local_tokens_start:local_tokens_end] = chunk_0_starts[local_tokens_start:local_tokens_end] + chunk_size_per_seq[seq_id]
+        chunk_1_starts[local_tokens_start:local_tokens_end] = chunk_size_per_seq[seq_id] * chunk_indices[1]
+        chunk_1_ends[local_tokens_start:local_tokens_end] = chunk_1_starts[local_tokens_start:local_tokens_end] + chunk_size_per_seq[seq_id]
+    block_sizes = chunk_0_ends - chunk_0_starts
+    local_attn_ranges = torch.ones(
+        2, 2, attn_ranges.shape[-1], dtype=attn_ranges.dtype, device=attn_ranges.device
+    ) * -1
+    if attn_ranges.dim() == 2:
+        range_start_in_chunk0 = torch.clamp(attn_ranges[0, :], min=chunk_0_starts, max=chunk_0_ends) - chunk_0_starts
+        range_end_in_chunk0 = torch.clamp(attn_ranges[1, :], min=chunk_0_starts, max=chunk_0_ends) - chunk_0_starts
+        range_start_in_chunk1 = torch.clamp(attn_ranges[0, :], min=chunk_1_starts, max=chunk_1_ends) - chunk_1_starts + block_sizes
+        range_end_in_chunk1 = torch.clamp(attn_ranges[1, :], min=chunk_1_starts, max=chunk_1_ends) - chunk_1_starts + block_sizes
+        local_attn_ranges[0, 0, :] = range_start_in_chunk0
+        local_attn_ranges[0, 1, :] = range_end_in_chunk0
+        local_attn_ranges[1, 0, :] = range_start_in_chunk1
+        local_attn_ranges[1, 1, :] = range_end_in_chunk1
+    else:
+        range0_start_in_chunk0 = torch.clamp(attn_ranges[0, 0, :], min=chunk_0_starts, max=chunk_0_ends) - chunk_0_starts
+        range0_end_in_chunk0 = torch.clamp(attn_ranges[0, 1, :], min=chunk_0_starts, max=chunk_0_ends) - chunk_0_starts
+        range0_start_in_chunk1 = torch.clamp(attn_ranges[0, 0, :], min=chunk_1_starts, max=chunk_1_ends) - chunk_1_starts + block_sizes
+        range0_end_in_chunk1 = torch.clamp(attn_ranges[0, 1, :], min=chunk_1_starts, max=chunk_1_ends) - chunk_1_starts + block_sizes
+
+        range1_start_in_chunk0 = torch.clamp(attn_ranges[1, 0, :], min=chunk_0_starts, max=chunk_0_ends) - chunk_0_starts
+        range1_end_in_chunk0 = torch.clamp(attn_ranges[1, 1, :], min=chunk_0_starts, max=chunk_0_ends) - chunk_0_starts
+        range1_start_in_chunk1 = torch.clamp(attn_ranges[1, 0, :], min=chunk_1_starts, max=chunk_1_ends) - chunk_1_starts + block_sizes
+        range1_end_in_chunk1 = torch.clamp(attn_ranges[1, 1, :], min=chunk_1_starts, max=chunk_1_ends) - chunk_1_starts + block_sizes
+        valid_range0_chunk0 = (range0_start_in_chunk0 < range0_end_in_chunk0)
+        valid_range1_chunk0 = (range1_start_in_chunk0 < range1_end_in_chunk0)
+        valid_range0_chunk1 = (range0_start_in_chunk1 < range0_end_in_chunk1)
+        valid_range1_chunk1 = (range1_start_in_chunk1 < range1_end_in_chunk1)
+
+        local_attn_ranges[0, 0, ~valid_range0_chunk0] = range0_start_in_chunk1[~valid_range0_chunk0]
+        local_attn_ranges[0, 1, ~valid_range0_chunk0] = range0_end_in_chunk1[~valid_range0_chunk0]
+        local_attn_ranges[0, 0, ~valid_range0_chunk1] = range0_start_in_chunk0[~valid_range0_chunk1]
+        local_attn_ranges[0, 1, ~valid_range0_chunk1] = range0_end_in_chunk0[~valid_range0_chunk1]
+        local_attn_ranges[0, 0, valid_range0_chunk0 & valid_range0_chunk1] = range0_start_in_chunk0[valid_range0_chunk0 & valid_range0_chunk1]
+        local_attn_ranges[0, 1, valid_range0_chunk0 & valid_range0_chunk1] = range0_end_in_chunk1[valid_range0_chunk0 & valid_range0_chunk1]
+
+        local_attn_ranges[1, 0, ~valid_range1_chunk0] = range1_start_in_chunk1[~valid_range1_chunk0]
+        local_attn_ranges[1, 1, ~valid_range1_chunk0] = range1_end_in_chunk1[~valid_range1_chunk0]
+        local_attn_ranges[1, 0, ~valid_range1_chunk1] = range1_start_in_chunk0[~valid_range1_chunk1]
+        local_attn_ranges[1, 1, ~valid_range1_chunk1] = range1_end_in_chunk0[~valid_range1_chunk1]
+        local_attn_ranges[1, 0, valid_range1_chunk0 & valid_range1_chunk1] = range1_start_in_chunk0[valid_range1_chunk0 & valid_range1_chunk1]
+        local_attn_ranges[1, 1, valid_range1_chunk0 & valid_range1_chunk1] = range1_end_in_chunk1[valid_range1_chunk0 & valid_range1_chunk1]
+    return local_attn_ranges
 
 class AttnFuncWithCPAndKVP2P(torch.autograd.Function):
     """
@@ -1770,6 +1848,7 @@ class AttnFuncWithCPAndKVP2P(torch.autograd.Function):
         cp_group,
         cp_global_ranks,
         cp_stream,
+        attn_ranges,
     ):
         # pylint: disable=missing-function-docstring
         if softmax_scale is None:
@@ -1800,6 +1879,9 @@ class AttnFuncWithCPAndKVP2P(torch.autograd.Function):
 
         causal = "causal" in attn_mask_type
         padding = "padding" in attn_mask_type
+
+        if attn_ranges is not None:
+            assert qkv_format == "thd", "attn_ranges is only supported with thd format."
 
         seq_dim = None
         if qkv_format in ["bshd", "sbhd"]:
@@ -1872,9 +1954,32 @@ class AttnFuncWithCPAndKVP2P(torch.autograd.Function):
         if cp_size_a2a > 1:
             chunk_ids_for_a2a = get_seq_chunk_ids_for_reordering(cp_size_a2a, q.device, True)
             if qkv_format == "thd":
-                q, k, v = flash_attn_a2a_communicate_thd(
-                    [q, k, v], chunk_ids_for_a2a, cu_seqlens_q_local_padded_cpu, cp_size_a2a, cp_group_a2a, cp_stream, True
-                )
+                if attn_ranges is not None:
+                    if attn_ranges.dim() == 2:
+                        attn_ranges = attn_ranges.permute(1, 0).repeat(cp_size_a2a, 1)
+                    elif attn_ranges.dim() == 3:
+                        attn_ranges = attn_ranges.permute(2, 0, 1).repeat(cp_size_a2a, 1, 1)
+                    else:
+                        raise ValueError("attn_ranges must be 2D or 3D!")
+                    q, k, v, attn_ranges = flash_attn_a2a_communicate_thd(
+                        [q, k, v, attn_ranges],
+                        chunk_ids_for_a2a,
+                        cu_seqlens_q_local_padded_cpu,
+                        cp_size_a2a,
+                        cp_group_a2a,
+                        cp_stream,
+                        True,
+                    )
+                    if attn_ranges.dim() == 2:
+                        attn_ranges = attn_ranges.permute(1, 0)
+                    elif attn_ranges.dim() == 3:
+                        attn_ranges = attn_ranges.permute(1, 2, 0)
+                    else:
+                        raise ValueError("attn_ranges must be 2D or 3D!")
+                else:
+                    q, k, v = flash_attn_a2a_communicate_thd(
+                        [q, k, v], chunk_ids_for_a2a, cu_seqlens_q_local_padded_cpu, cp_size_a2a, cp_group_a2a, cp_stream, True
+                    )
             else:
                 q, k, v = flash_attn_a2a_communicate(
                     [q, k, v], chunk_ids_for_a2a, seq_dim, cp_size_a2a, cp_group_a2a, cp_stream, True
@@ -1930,15 +2035,18 @@ class AttnFuncWithCPAndKVP2P(torch.autograd.Function):
                 flash_attn_fwd = flash_attn_varlen_fwd_v3
                 fa_forward_kwargs["window_size"] = (-1, 0) if causal else (-1, -1)
             else:
-                flash_attn_fwd = flash_attn_varlen_fwd
-                fa_forward_kwargs["dropout_p"] = dropout_p
-                fa_forward_kwargs["return_softmax"] = False
-                if _flash_attn_2_3_plus:
-                    fa_forward_kwargs["window_size"] = (-1, 0) if causal else (-1, -1)
-                if _flash_attn_2_4_plus:
-                    fa_forward_kwargs["alibi_slopes"] = None
-                if _flash_attn_2_5_7_plus:
-                    fa_forward_kwargs["block_table"] = None
+                if attn_ranges is not None:
+                    flash_attn_fwd = bblock_flash_attn_varlen_fwd
+                else:
+                    flash_attn_fwd = flash_attn_varlen_fwd
+                    fa_forward_kwargs["dropout_p"] = dropout_p
+                    fa_forward_kwargs["return_softmax"] = False
+                    if _flash_attn_2_3_plus:
+                        fa_forward_kwargs["window_size"] = (-1, 0) if causal else (-1, -1)
+                    if _flash_attn_2_4_plus:
+                        fa_forward_kwargs["alibi_slopes"] = None
+                    if _flash_attn_2_5_7_plus:
+                        fa_forward_kwargs["block_table"] = None
 
         # Flash Attn inputs
         q_inputs = [None, None]
@@ -1962,6 +2070,11 @@ class AttnFuncWithCPAndKVP2P(torch.autograd.Function):
             p2p_comm_buffers[0] = torch.cat((k.unsqueeze(0), v.unsqueeze(0)), dim=0)
         send_recv_reqs = [[], []]
 
+        if qkv_format == "thd":
+            local_total_q = cu_seqlens_q[-1].item() // cp_size
+            local_total_kv = cu_seqlens_kv[-1].item() // cp_size
+
+        softmax_lse = None
         softmax_lse_ = None
         out = None
         for i in range(cp_size + 1):
@@ -2380,21 +2493,40 @@ class AttnFuncWithCPAndKVP2P(torch.autograd.Function):
                             q_inputs[i % 2] = q.view(-1, *q.shape[-2:])
                             # [2, b, sk, np, hn] -> [2, b*sk, np, hn]
                             kv_inputs[i % 2] = kv_inputs[i % 2].view(2, -1, *k.shape[-2:])
-                            fa_outputs = flash_attn_fwd(
-                                q_inputs[i % 2],
-                                kv_inputs[i % 2][0],
-                                kv_inputs[i % 2][1],
-                                cu_seqlens_q_per_step[i],
-                                cu_seqlens_kv_per_step[i],
-                                max_seqlen_q,
-                                max_seqlen_kv,
-                                causal=False,
-                                **fa_forward_kwargs,
-                            )
-                            out_per_step[i] = fa_outputs[4]
-                            softmax_lse_per_step[i] = fa_outputs[5]
-                            if not _use_flash_attn_3:
-                                rng_states[i] = fa_outputs[7]
+                            if attn_ranges is not None:
+                                attn_range = _get_local_attn_range(
+                                    i, rank, cp_size, attn_ranges, cu_seqlens_q
+                                )
+                                fa_out, fa_lse, fa_rng_state = flash_attn_fwd(
+                                    q_inputs[i % 2],
+                                    kv_inputs[i % 2][0],
+                                    kv_inputs[i % 2][1],
+                                    cu_seqlens_q_per_step[i],
+                                    cu_seqlens_kv_per_step[i],
+                                    local_total_q,
+                                    max_seqlen_q,
+                                    max_seqlen_kv,
+                                    attn_range,
+                                )
+                                out_per_step[i] = fa_out
+                                softmax_lse_per_step[i] = fa_lse
+                                rng_states[i] = fa_rng_state
+                            else:
+                                fa_outputs = flash_attn_fwd(
+                                    q_inputs[i % 2],
+                                    kv_inputs[i % 2][0],
+                                    kv_inputs[i % 2][1],
+                                    cu_seqlens_q_per_step[i],
+                                    cu_seqlens_kv_per_step[i],
+                                    max_seqlen_q,
+                                    max_seqlen_kv,
+                                    causal=False,
+                                    **fa_forward_kwargs,
+                                )
+                                out_per_step[i] = fa_outputs[4]
+                                softmax_lse_per_step[i] = fa_outputs[5]
+                                if not _use_flash_attn_3:
+                                    rng_states[i] = fa_outputs[7]
 
             if i > 0:
                 # wait until fwd restuls correction of last step is done
@@ -2598,8 +2730,12 @@ class AttnFuncWithCPAndKVP2P(torch.autograd.Function):
             *rng_states,
             *attn_biases,
         )
+        ctx.attn_ranges = attn_ranges
+        ctx.cu_seqlens_q = cu_seqlens_q
         ctx.cp_group_a2a = cp_group_a2a
         ctx.cp_size_a2a = cp_size_a2a
+        ctx.local_total_q = local_total_q
+        ctx.local_total_kv = local_total_kv
         ctx.rank_a2a = rank_a2a
         ctx.cp_group = cp_group
         ctx.cp_global_ranks = cp_global_ranks
@@ -2640,6 +2776,7 @@ class AttnFuncWithCPAndKVP2P(torch.autograd.Function):
         cu_seqlens_kv_per_step = saved_tensors[8 + cp_size : 8 + cp_size * 2]
         rng_states = saved_tensors[8 + cp_size * 2 : 8 + cp_size * 3]
         attn_biases = saved_tensors[8 + cp_size * 3 : 8 + cp_size * 4]
+        attn_ranges = ctx.attn_ranges
 
         causal = "causal" in ctx.attn_mask_type
         padding = "padding" in ctx.attn_mask_type
@@ -2792,12 +2929,15 @@ class AttnFuncWithCPAndKVP2P(torch.autograd.Function):
                 flash_attn_bwd = flash_attn_varlen_bwd_v3
                 fa_backward_kwargs["deterministic"] = ctx.deterministic
             else:
-                flash_attn_bwd = flash_attn_varlen_bwd
-                fa_backward_kwargs["dropout_p"] = ctx.dropout_p
-                if _flash_attn_2_4_plus:
-                    fa_backward_kwargs["alibi_slopes"] = None
-                if _flash_attn_2_4_1_plus:
-                    fa_backward_kwargs["deterministic"] = ctx.deterministic
+                if attn_ranges is not None:
+                    flash_attn_bwd = bblock_flash_attn_varlen_bwd
+                else:
+                    flash_attn_bwd = flash_attn_varlen_bwd
+                    fa_backward_kwargs["dropout_p"] = ctx.dropout_p
+                    if _flash_attn_2_4_plus:
+                        fa_backward_kwargs["alibi_slopes"] = None
+                    if _flash_attn_2_4_1_plus:
+                        fa_backward_kwargs["deterministic"] = ctx.deterministic
 
         for i in range(cp_size):
             # wait until KV is received
@@ -2832,9 +2972,13 @@ class AttnFuncWithCPAndKVP2P(torch.autograd.Function):
                 if i == (cp_size - 1):
                     send_tensor = send_tensor[1]
                     recv_tensor = recv_tensor[1]
-                send_recv_reqs = flash_attn_p2p_communicate(
-                    rank, send_tensor, send_dst, recv_tensor, recv_src, ctx.cp_group, batch_p2p_comm
-                )
+                if torch.distributed.get_world_size(ctx.cp_group) == 1:
+                    recv_tensor.copy_(send_tensor)
+                    send_recv_reqs = []
+                else:
+                    send_recv_reqs = flash_attn_p2p_communicate(
+                        rank, send_tensor, send_dst, recv_tensor, recv_src, ctx.cp_group, batch_p2p_comm
+                    )
 
             kv = p2p_comm_buffers[i % 2][0]
             dk_, dv_ = None, None
@@ -3168,29 +3312,52 @@ class AttnFuncWithCPAndKVP2P(torch.autograd.Function):
                     # [b, sq, np, hn] -> [b*sq, np, hn]
                     out_ = out.view(-1, *out.shape[-2:])
                     dout_ = dout.view(-1, *dout.shape[-2:])
-                    if _use_flash_attn_3 or _flash_attn_2_3_plus:
-                        fa_backward_kwargs["window_size"] = (-1, -1)
-                    if not _use_flash_attn_3 and _flash_attn_2_6_3_plus:
-                        fa_backward_kwargs["softcap"] = 0.0
-                    if not _use_flash_attn_3:
-                        fa_backward_kwargs["rng_state"] = rng_states[cp_size - i - 1]
-                    flash_attn_bwd(
-                        dout_,
-                        q_,
-                        kv_[0],
-                        kv_[1],
-                        out_,
-                        softmax_lse,
-                        dq_,
-                        dkv_[0],
-                        dkv_[1],
-                        cu_seqlens_q_per_step[cp_size - i - 1],
-                        cu_seqlens_kv_per_step[cp_size - i - 1],
-                        ctx.max_seqlen_q,
-                        ctx.max_seqlen_kv,
-                        causal=False,
-                        **fa_backward_kwargs,
-                    )
+                    if attn_ranges is not None:
+                        attn_range = _get_local_attn_range(
+                            i, rank, cp_size, attn_ranges, ctx.cu_seqlens_q, is_bw=True
+                        )
+                        flash_attn_bwd(
+                            dout_,
+                            q_,
+                            kv_[0],
+                            kv_[1],
+                            out_,
+                            softmax_lse,
+                            cu_seqlens_q_per_step[cp_size - i - 1],
+                            cu_seqlens_kv_per_step[cp_size - i - 1],
+                            ctx.local_total_q,
+                            ctx.local_total_kv,
+                            ctx.max_seqlen_q,
+                            ctx.max_seqlen_kv,
+                            attn_mask=attn_range,
+                            dq=dq_,
+                            dk=dkv_[0],
+                            dv=dkv_[1],
+                        )
+                    else:
+                        if _use_flash_attn_3 or _flash_attn_2_3_plus:
+                            fa_backward_kwargs["window_size"] = (-1, -1)
+                        if not _use_flash_attn_3 and _flash_attn_2_6_3_plus:
+                            fa_backward_kwargs["softcap"] = 0.0
+                        if not _use_flash_attn_3:
+                            fa_backward_kwargs["rng_state"] = rng_states[cp_size - i - 1]
+                        flash_attn_bwd(
+                            dout_,
+                            q_,
+                            kv_[0],
+                            kv_[1],
+                            out_,
+                            softmax_lse,
+                            dq_,
+                            dkv_[0],
+                            dkv_[1],
+                            cu_seqlens_q_per_step[cp_size - i - 1],
+                            cu_seqlens_kv_per_step[cp_size - i - 1],
+                            ctx.max_seqlen_q,
+                            ctx.max_seqlen_kv,
+                            causal=False,
+                            **fa_backward_kwargs,
+                        )
 
             if ctx.fp8:
                 dq = dq_fp8[(rank + i + 1) % cp_size]
@@ -3454,6 +3621,7 @@ class AttnFuncWithCPAndKVP2P(torch.autograd.Function):
             None,
             None,
             attn_dbias,
+            None,
             None,
             None,
             None,
@@ -4417,6 +4585,7 @@ def attn_forward_func_with_cp(
     window_size=None,
     fp8=False,
     fp8_meta=None,
+    attn_ranges=None,
 ) -> torch.Tensor:
     """
     Attention implementation with context parallelism.
@@ -4493,7 +4662,7 @@ def attn_forward_func_with_cp(
     ]
 
     if cp_comm_type in ["p2p", "a2a+p2p"]:
-        args += [fp8, fp8_meta, cp_group, cp_global_ranks, cp_stream]
+        args += [fp8, fp8_meta, cp_group, cp_global_ranks, cp_stream, attn_ranges]
         out = AttnFuncWithCPAndKVP2P.apply(*args)
     elif cp_comm_type == "all_gather":
         args.pop(5)
@@ -5301,7 +5470,7 @@ def check_set_window_size(
             assert False, (
                 "window_size should be (-1, 0) or (>=0, 0) for attn_mask_type=" + attn_mask_type
             )
-    elif attn_mask_type in ["no_mask", "padding", "arbitrary"]:
+    elif attn_mask_type in ["no_mask", "padding", "arbitrary", "custom_ranges"]:
         if orig_window_size is None:
             window_size = (-1, -1)
         elif orig_window_size == (-1, 0):
@@ -5373,6 +5542,7 @@ class FlashAttention(torch.nn.Module):
         cp_comm_type: str = "p2p",
         fp8: bool = False,
         fp8_meta: Optional[Dict[str, Any]] = None,
+        attn_ranges: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """flash-attn fprop"""
 
@@ -5393,7 +5563,7 @@ class FlashAttention(torch.nn.Module):
         elif isinstance(cp_group, list):
             for group in cp_group:
                 cp_size *= get_distributed_world_size(group)
-        context_parallel = cp_size > 1
+        context_parallel = cp_size > 1 or attn_ranges is not None
 
         qkv_format = "".join([i for i in qkv_layout.split("_")[0] if i.isalpha()])
 
@@ -5497,7 +5667,6 @@ class FlashAttention(torch.nn.Module):
             if max_seqlen_kv is None:
                 seqlens_kv = cu_seqlens_kv[1:] - cu_seqlens_kv[:-1]
                 max_seqlen_kv = seqlens_kv.max().item()
-
         if context_parallel and all(
             not isinstance(x, Float8Tensor) for x in [query_layer, key_layer, value_layer]
         ):
@@ -5526,6 +5695,7 @@ class FlashAttention(torch.nn.Module):
                     attn_mask_type=attn_mask_type,
                     deterministic=self.deterministic,
                     window_size=window_size,
+                    attn_ranges=attn_ranges,
                 )
         else:
 
@@ -7787,6 +7957,7 @@ class DotProductAttention(TransformerEngineBaseModule):
         fast_zero_fill: bool = True,
         inference_params: Optional[InferenceParams] = None,
         is_first_microbatch: Optional[bool] = None,
+        attn_ranges : Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Dot Product Attention Layer.
@@ -8134,7 +8305,7 @@ class DotProductAttention(TransformerEngineBaseModule):
             elif isinstance(self.cp_group, list):
                 for group in self.cp_group:
                     cp_size *= get_distributed_world_size(group)
-            context_parallel = cp_size > 1
+            context_parallel = cp_size > 1 or attn_ranges is not None
 
             if qkv_format in ["sbhd", "bshd"]:
                 assert all(
@@ -8340,6 +8511,7 @@ class DotProductAttention(TransformerEngineBaseModule):
                     max_seqlen_kv=max_seqlen_kv,
                     fp8=self.fp8 and self.fp8_meta["recipe"].fp8_dpa,
                     fp8_meta=self.fp8_meta,
+                    attn_ranges=attn_ranges,
                 )
 
             if use_fused_attention:

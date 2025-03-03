@@ -30,6 +30,7 @@ AttnMaskTypes = (
     "causal_bottom_right",
     "padding_causal_bottom_right",
     "arbitrary",
+    "custom_ranges"
 )
 
 AttnTypes = ("self", "cross")

@@ -1651,6 +1651,7 @@ __global__ void thd_out_correction_kernel(dtype *out, dtype *out_per_step, float
         idx = row * lse_seqlen + col + seq_len * only_second_half;
         idx_per_step = row * lse_seqlen / (only_second_half + 1) + col;
       }
+      bool lse_per_step_is_finite = isfinite(lse_per_step[idx_per_step]);
       float lse_corrected_exp = exp(lse_per_step[idx_per_step] - lse[idx]);
 
       idx = token_id + cu_seqlens_s[seq_id + 1] * only_second_half;
@@ -1665,7 +1666,7 @@ __global__ void thd_out_correction_kernel(dtype *out, dtype *out_per_step, float
         dtype *p_per_step = reinterpret_cast<dtype *>(&data_per_step);
         dtype *p = reinterpret_cast<dtype *>(&data);
         for (int k = 0; k < sizeof(float4) / sizeof(dtype); k++) {
-          p[k] += (p_per_step[k] == 0 ? 0 : p_per_step[k] * lse_corrected_exp);
+          p[k] += (p_per_step[k] == 0 || !lse_per_step_is_finite ? 0 : p_per_step[k] * lse_corrected_exp);
         }
         reinterpret_cast<float4 *>(cur_out)[j] = data;
       }

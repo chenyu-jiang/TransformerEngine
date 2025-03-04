@@ -1747,68 +1747,6 @@ def flash_attn_a2a_communicate(
     torch.cuda.current_stream().wait_stream(cp_stream)
     return a2a_outputs[0] if len(a2a_inputs) == 1 else a2a_outputs
 
-def _get_local_attn_range(step_idx: int, p2p_rank: int, cp_size: int, attn_ranges: torch.Tensor, cu_seqlens: torch.Tensor, is_bw: bool = False) -> torch.Tensor:
-    n_chunks = 2 * cp_size
-    if is_bw:
-        step_idx = cp_size - step_idx - 1
-    current_step_kv_rank = (p2p_rank - step_idx + cp_size) % cp_size
-    raw_seqlens = cu_seqlens[1:] - cu_seqlens[:-1]
-    local_total_cu_seqlens = cu_seqlens // cp_size
-    chunk_size_per_seq = raw_seqlens // n_chunks
-    chunk_indices = [current_step_kv_rank, 2 * cp_size - current_step_kv_rank - 1]
-    chunk_0_starts = torch.zeros(attn_ranges.shape[-1], dtype=attn_ranges.dtype, device=attn_ranges.device)
-    chunk_0_ends = torch.zeros(attn_ranges.shape[-1], dtype=attn_ranges.dtype, device=attn_ranges.device)
-    chunk_1_starts = torch.zeros(attn_ranges.shape[-1], dtype=attn_ranges.dtype, device=attn_ranges.device)
-    chunk_1_ends = torch.zeros(attn_ranges.shape[-1], dtype=attn_ranges.dtype, device=attn_ranges.device)
-    for seq_id in range(raw_seqlens.shape[0]):
-        local_tokens_start = local_total_cu_seqlens[seq_id]
-        local_tokens_end = local_total_cu_seqlens[seq_id + 1]
-        chunk_0_starts[local_tokens_start:local_tokens_end] = chunk_size_per_seq[seq_id] * chunk_indices[0]
-        chunk_0_ends[local_tokens_start:local_tokens_end] = chunk_0_starts[local_tokens_start:local_tokens_end] + chunk_size_per_seq[seq_id]
-        chunk_1_starts[local_tokens_start:local_tokens_end] = chunk_size_per_seq[seq_id] * chunk_indices[1]
-        chunk_1_ends[local_tokens_start:local_tokens_end] = chunk_1_starts[local_tokens_start:local_tokens_end] + chunk_size_per_seq[seq_id]
-    block_sizes = chunk_0_ends - chunk_0_starts
-    local_attn_ranges = torch.ones(
-        2, 2, attn_ranges.shape[-1], dtype=attn_ranges.dtype, device=attn_ranges.device
-    ) * -1
-    if attn_ranges.dim() == 2:
-        range_start_in_chunk0 = torch.clamp(attn_ranges[0, :], min=chunk_0_starts, max=chunk_0_ends) - chunk_0_starts
-        range_end_in_chunk0 = torch.clamp(attn_ranges[1, :], min=chunk_0_starts, max=chunk_0_ends) - chunk_0_starts
-        range_start_in_chunk1 = torch.clamp(attn_ranges[0, :], min=chunk_1_starts, max=chunk_1_ends) - chunk_1_starts + block_sizes
-        range_end_in_chunk1 = torch.clamp(attn_ranges[1, :], min=chunk_1_starts, max=chunk_1_ends) - chunk_1_starts + block_sizes
-        local_attn_ranges[0, 0, :] = range_start_in_chunk0
-        local_attn_ranges[0, 1, :] = range_end_in_chunk0
-        local_attn_ranges[1, 0, :] = range_start_in_chunk1
-        local_attn_ranges[1, 1, :] = range_end_in_chunk1
-    else:
-        range0_start_in_chunk0 = torch.clamp(attn_ranges[0, 0, :], min=chunk_0_starts, max=chunk_0_ends) - chunk_0_starts
-        range0_end_in_chunk0 = torch.clamp(attn_ranges[0, 1, :], min=chunk_0_starts, max=chunk_0_ends) - chunk_0_starts
-        range0_start_in_chunk1 = torch.clamp(attn_ranges[0, 0, :], min=chunk_1_starts, max=chunk_1_ends) - chunk_1_starts + block_sizes
-        range0_end_in_chunk1 = torch.clamp(attn_ranges[0, 1, :], min=chunk_1_starts, max=chunk_1_ends) - chunk_1_starts + block_sizes
-
-        range1_start_in_chunk0 = torch.clamp(attn_ranges[1, 0, :], min=chunk_0_starts, max=chunk_0_ends) - chunk_0_starts
-        range1_end_in_chunk0 = torch.clamp(attn_ranges[1, 1, :], min=chunk_0_starts, max=chunk_0_ends) - chunk_0_starts
-        range1_start_in_chunk1 = torch.clamp(attn_ranges[1, 0, :], min=chunk_1_starts, max=chunk_1_ends) - chunk_1_starts + block_sizes
-        range1_end_in_chunk1 = torch.clamp(attn_ranges[1, 1, :], min=chunk_1_starts, max=chunk_1_ends) - chunk_1_starts + block_sizes
-        valid_range0_chunk0 = (range0_start_in_chunk0 < range0_end_in_chunk0)
-        valid_range1_chunk0 = (range1_start_in_chunk0 < range1_end_in_chunk0)
-        valid_range0_chunk1 = (range0_start_in_chunk1 < range0_end_in_chunk1)
-        valid_range1_chunk1 = (range1_start_in_chunk1 < range1_end_in_chunk1)
-
-        local_attn_ranges[0, 0, ~valid_range0_chunk0] = range0_start_in_chunk1[~valid_range0_chunk0]
-        local_attn_ranges[0, 1, ~valid_range0_chunk0] = range0_end_in_chunk1[~valid_range0_chunk0]
-        local_attn_ranges[0, 0, ~valid_range0_chunk1] = range0_start_in_chunk0[~valid_range0_chunk1]
-        local_attn_ranges[0, 1, ~valid_range0_chunk1] = range0_end_in_chunk0[~valid_range0_chunk1]
-        local_attn_ranges[0, 0, valid_range0_chunk0 & valid_range0_chunk1] = range0_start_in_chunk0[valid_range0_chunk0 & valid_range0_chunk1]
-        local_attn_ranges[0, 1, valid_range0_chunk0 & valid_range0_chunk1] = range0_end_in_chunk1[valid_range0_chunk0 & valid_range0_chunk1]
-
-        local_attn_ranges[1, 0, ~valid_range1_chunk0] = range1_start_in_chunk1[~valid_range1_chunk0]
-        local_attn_ranges[1, 1, ~valid_range1_chunk0] = range1_end_in_chunk1[~valid_range1_chunk0]
-        local_attn_ranges[1, 0, ~valid_range1_chunk1] = range1_start_in_chunk0[~valid_range1_chunk1]
-        local_attn_ranges[1, 1, ~valid_range1_chunk1] = range1_end_in_chunk0[~valid_range1_chunk1]
-        local_attn_ranges[1, 0, valid_range1_chunk0 & valid_range1_chunk1] = range1_start_in_chunk0[valid_range1_chunk0 & valid_range1_chunk1]
-        local_attn_ranges[1, 1, valid_range1_chunk0 & valid_range1_chunk1] = range1_end_in_chunk1[valid_range1_chunk0 & valid_range1_chunk1]
-    return local_attn_ranges
 
 class AttnFuncWithCPAndKVP2P(torch.autograd.Function):
     """
@@ -1848,7 +1786,7 @@ class AttnFuncWithCPAndKVP2P(torch.autograd.Function):
         cp_group,
         cp_global_ranks,
         cp_stream,
-        attn_ranges,
+        attn_ranges_per_step,
     ):
         # pylint: disable=missing-function-docstring
         if softmax_scale is None:
@@ -1880,7 +1818,7 @@ class AttnFuncWithCPAndKVP2P(torch.autograd.Function):
         causal = "causal" in attn_mask_type
         padding = "padding" in attn_mask_type
 
-        if attn_ranges is not None:
+        if attn_ranges_per_step is not None:
             assert qkv_format == "thd", "attn_ranges is only supported with thd format."
 
         seq_dim = None
@@ -1899,9 +1837,12 @@ class AttnFuncWithCPAndKVP2P(torch.autograd.Function):
         cu_seqlens_q_per_step = [None for _ in range(cp_size)]
         cu_seqlens_kv_per_step = [None for _ in range(cp_size)]
 
-        if cp_size_a2a > 1 and qkv_format == "thd":
+        if cp_size_a2a > 1 and qkv_format == "thd" or attn_ranges_per_step is not None:
             cu_seqlens_q_local_padded_cpu = (cu_seqlens_q_padded // cp_size_a2a).cpu()
             ctx.cu_seqlens_q_local_padded_cpu = cu_seqlens_q_local_padded_cpu
+
+        if attn_ranges_per_step is not None:
+            assert len(attn_ranges_per_step) == cp_size
 
         fused_attn_qkv_dtype = None
         fused_attn_backend = None
@@ -2038,7 +1979,7 @@ class AttnFuncWithCPAndKVP2P(torch.autograd.Function):
                 flash_attn_fwd = flash_attn_varlen_fwd_v3
                 fa_forward_kwargs["window_size"] = (-1, 0) if causal else (-1, -1)
             else:
-                if attn_ranges is not None:
+                if attn_ranges_per_step is not None:
                     flash_attn_fwd = bblock_flash_attn_varlen_fwd
                 else:
                     flash_attn_fwd = flash_attn_varlen_fwd
@@ -2496,10 +2437,11 @@ class AttnFuncWithCPAndKVP2P(torch.autograd.Function):
                             q_inputs[i % 2] = q.view(-1, *q.shape[-2:])
                             # [2, b, sk, np, hn] -> [2, b*sk, np, hn]
                             kv_inputs[i % 2] = kv_inputs[i % 2].view(2, -1, *k.shape[-2:])
-                            if attn_ranges is not None:
-                                attn_range = _get_local_attn_range(
-                                    i, rank, cp_size, attn_ranges, cu_seqlens_q
-                                )
+                            if attn_ranges_per_step is not None:
+                                # attn_range = _get_local_attn_range(
+                                #     i, rank, cp_size, attn_ranges, cu_seqlens_q
+                                # )
+                                attn_range = attn_ranges_per_step[i]
                                 fa_out, fa_lse, fa_rng_state = flash_attn_fwd(
                                     q_inputs[i % 2],
                                     kv_inputs[i % 2][0],
@@ -2733,7 +2675,7 @@ class AttnFuncWithCPAndKVP2P(torch.autograd.Function):
             *rng_states,
             *attn_biases,
         )
-        ctx.attn_ranges = attn_ranges
+        ctx.attn_ranges_per_step = attn_ranges_per_step
         ctx.cu_seqlens_q = cu_seqlens_q
         ctx.cp_group_a2a = cp_group_a2a
         ctx.cp_size_a2a = cp_size_a2a
@@ -2779,7 +2721,7 @@ class AttnFuncWithCPAndKVP2P(torch.autograd.Function):
         cu_seqlens_kv_per_step = saved_tensors[8 + cp_size : 8 + cp_size * 2]
         rng_states = saved_tensors[8 + cp_size * 2 : 8 + cp_size * 3]
         attn_biases = saved_tensors[8 + cp_size * 3 : 8 + cp_size * 4]
-        attn_ranges = ctx.attn_ranges
+        attn_ranges_per_step = ctx.attn_ranges_per_step
 
         causal = "causal" in ctx.attn_mask_type
         padding = "padding" in ctx.attn_mask_type
@@ -2932,7 +2874,7 @@ class AttnFuncWithCPAndKVP2P(torch.autograd.Function):
                 flash_attn_bwd = flash_attn_varlen_bwd_v3
                 fa_backward_kwargs["deterministic"] = ctx.deterministic
             else:
-                if attn_ranges is not None:
+                if attn_ranges_per_step is not None:
                     flash_attn_bwd = bblock_flash_attn_varlen_bwd
                 else:
                     flash_attn_bwd = flash_attn_varlen_bwd
@@ -3315,10 +3257,11 @@ class AttnFuncWithCPAndKVP2P(torch.autograd.Function):
                     # [b, sq, np, hn] -> [b*sq, np, hn]
                     out_ = out.view(-1, *out.shape[-2:])
                     dout_ = dout.view(-1, *dout.shape[-2:])
-                    if attn_ranges is not None:
-                        attn_range = _get_local_attn_range(
-                            i, rank, cp_size, attn_ranges, ctx.cu_seqlens_q, is_bw=True
-                        )
+                    if attn_ranges_per_step is not None:
+                        # attn_range = _get_local_attn_range(
+                        #     i, rank, cp_size, attn_ranges, ctx.cu_seqlens_q, is_bw=True
+                        # )
+                        attn_range = attn_ranges_per_step[cp_size - i - 1]
                         flash_attn_bwd(
                             dout_,
                             q_,
@@ -4588,7 +4531,7 @@ def attn_forward_func_with_cp(
     window_size=None,
     fp8=False,
     fp8_meta=None,
-    attn_ranges=None,
+    attn_ranges_per_step=None,
 ) -> torch.Tensor:
     """
     Attention implementation with context parallelism.
@@ -4665,7 +4608,7 @@ def attn_forward_func_with_cp(
     ]
 
     if cp_comm_type in ["p2p", "a2a+p2p"]:
-        args += [fp8, fp8_meta, cp_group, cp_global_ranks, cp_stream, attn_ranges]
+        args += [fp8, fp8_meta, cp_group, cp_global_ranks, cp_stream, attn_ranges_per_step]
         out = AttnFuncWithCPAndKVP2P.apply(*args)
     elif cp_comm_type == "all_gather":
         args.pop(5)
@@ -5545,7 +5488,7 @@ class FlashAttention(torch.nn.Module):
         cp_comm_type: str = "p2p",
         fp8: bool = False,
         fp8_meta: Optional[Dict[str, Any]] = None,
-        attn_ranges: Optional[torch.Tensor] = None,
+        attn_ranges_per_step: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """flash-attn fprop"""
 
@@ -5566,7 +5509,7 @@ class FlashAttention(torch.nn.Module):
         elif isinstance(cp_group, list):
             for group in cp_group:
                 cp_size *= get_distributed_world_size(group)
-        context_parallel = cp_size > 1 or attn_ranges is not None
+        context_parallel = cp_size > 1 or attn_ranges_per_step is not None
 
         qkv_format = "".join([i for i in qkv_layout.split("_")[0] if i.isalpha()])
 
@@ -5698,7 +5641,7 @@ class FlashAttention(torch.nn.Module):
                     attn_mask_type=attn_mask_type,
                     deterministic=self.deterministic,
                     window_size=window_size,
-                    attn_ranges=attn_ranges,
+                    attn_ranges_per_step=attn_ranges_per_step,
                 )
         else:
 
@@ -7960,7 +7903,7 @@ class DotProductAttention(TransformerEngineBaseModule):
         fast_zero_fill: bool = True,
         inference_params: Optional[InferenceParams] = None,
         is_first_microbatch: Optional[bool] = None,
-        attn_ranges : Optional[torch.Tensor] = None,
+        attn_ranges_per_step : Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Dot Product Attention Layer.
@@ -8308,7 +8251,7 @@ class DotProductAttention(TransformerEngineBaseModule):
             elif isinstance(self.cp_group, list):
                 for group in self.cp_group:
                     cp_size *= get_distributed_world_size(group)
-            context_parallel = cp_size > 1 or attn_ranges is not None
+            context_parallel = cp_size > 1 or attn_ranges_per_step is not None
 
             if qkv_format in ["sbhd", "bshd"]:
                 assert all(
@@ -8514,7 +8457,7 @@ class DotProductAttention(TransformerEngineBaseModule):
                     max_seqlen_kv=max_seqlen_kv,
                     fp8=self.fp8 and self.fp8_meta["recipe"].fp8_dpa,
                     fp8_meta=self.fp8_meta,
-                    attn_ranges=attn_ranges,
+                    attn_ranges_per_step=attn_ranges_per_step,
                 )
 
             if use_fused_attention:

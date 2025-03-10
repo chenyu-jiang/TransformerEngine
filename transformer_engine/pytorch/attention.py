@@ -5488,7 +5488,7 @@ class FlashAttention(torch.nn.Module):
         cp_comm_type: str = "p2p",
         fp8: bool = False,
         fp8_meta: Optional[Dict[str, Any]] = None,
-        attn_ranges_per_step: Optional[torch.Tensor] = None,
+        attn_ranges_per_step: Optional[List[torch.Tensor]] = None,
     ) -> torch.Tensor:
         """flash-attn fprop"""
 
@@ -7903,7 +7903,7 @@ class DotProductAttention(TransformerEngineBaseModule):
         fast_zero_fill: bool = True,
         inference_params: Optional[InferenceParams] = None,
         is_first_microbatch: Optional[bool] = None,
-        attn_ranges_per_step : Optional[torch.Tensor] = None,
+        attn_ranges_per_step : Optional[List[torch.Tensor]] = None,
     ) -> torch.Tensor:
         """
         Dot Product Attention Layer.
@@ -8143,7 +8143,7 @@ class DotProductAttention(TransformerEngineBaseModule):
             ), f"Attention mask type {attn_mask_type} is not supported!"
             if qkv_format == "thd":
                 assert (
-                    "padding" in attn_mask_type
+                    "padding" in attn_mask_type or attn_mask_type == "custom_ranges"
                 ), "Attention mask type must be padding or padding_causal for qkv_format=thd!"
 
             if window_size is None:

@@ -1787,6 +1787,7 @@ class AttnFuncWithCPAndKVP2P(torch.autograd.Function):
         cp_global_ranks,
         cp_stream,
         attn_ranges_per_step,
+        cu_seqlens_q_padded_cpu,
     ):
         # pylint: disable=missing-function-docstring
         if softmax_scale is None:
@@ -1838,7 +1839,12 @@ class AttnFuncWithCPAndKVP2P(torch.autograd.Function):
         cu_seqlens_kv_per_step = [None for _ in range(cp_size)]
 
         if cp_size_a2a > 1 and qkv_format == "thd" or attn_ranges_per_step is not None:
-            cu_seqlens_q_local_padded_cpu = (cu_seqlens_q_padded // cp_size_a2a).cpu()
+            if cu_seqlens_q_padded_cpu is None:
+                # fall back at the cost of extra sync
+                cu_seqlens_q_local_padded_cpu = (cu_seqlens_q_padded // cp_size_a2a).cpu()
+            else:
+                cu_seqlens_q_local_padded_cpu = cu_seqlens_q_padded_cpu // cp_size_a2a
+                assert not cu_seqlens_q_local_padded_cpu.is_cuda
             ctx.cu_seqlens_q_local_padded_cpu = cu_seqlens_q_local_padded_cpu
 
         if attn_ranges_per_step is not None:
@@ -4532,6 +4538,7 @@ def attn_forward_func_with_cp(
     fp8=False,
     fp8_meta=None,
     attn_ranges_per_step=None,
+    cu_seqlens_q_padded_cpu=None,
 ) -> torch.Tensor:
     """
     Attention implementation with context parallelism.
@@ -4608,7 +4615,7 @@ def attn_forward_func_with_cp(
     ]
 
     if cp_comm_type in ["p2p", "a2a+p2p"]:
-        args += [fp8, fp8_meta, cp_group, cp_global_ranks, cp_stream, attn_ranges_per_step]
+        args += [fp8, fp8_meta, cp_group, cp_global_ranks, cp_stream, attn_ranges_per_step, cu_seqlens_q_padded_cpu]
         out = AttnFuncWithCPAndKVP2P.apply(*args)
     elif cp_comm_type == "all_gather":
         args.pop(5)
@@ -5489,6 +5496,7 @@ class FlashAttention(torch.nn.Module):
         fp8: bool = False,
         fp8_meta: Optional[Dict[str, Any]] = None,
         attn_ranges_per_step: Optional[List[torch.Tensor]] = None,
+        cu_seqlens_q_cpu: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """flash-attn fprop"""
 
@@ -5642,6 +5650,7 @@ class FlashAttention(torch.nn.Module):
                     deterministic=self.deterministic,
                     window_size=window_size,
                     attn_ranges_per_step=attn_ranges_per_step,
+                    cu_seqlens_q_padded_cpu=cu_seqlens_q_cpu,
                 )
         else:
 
@@ -7904,6 +7913,7 @@ class DotProductAttention(TransformerEngineBaseModule):
         inference_params: Optional[InferenceParams] = None,
         is_first_microbatch: Optional[bool] = None,
         attn_ranges_per_step : Optional[List[torch.Tensor]] = None,
+        cu_seqlens_q_cpu: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Dot Product Attention Layer.
@@ -8458,6 +8468,7 @@ class DotProductAttention(TransformerEngineBaseModule):
                     fp8=self.fp8 and self.fp8_meta["recipe"].fp8_dpa,
                     fp8_meta=self.fp8_meta,
                     attn_ranges_per_step=attn_ranges_per_step,
+                    cu_seqlens_q_cpu=cu_seqlens_q_cpu,
                 )
 
             if use_fused_attention:

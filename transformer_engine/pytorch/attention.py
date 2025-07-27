@@ -1508,15 +1508,18 @@ def flash_attn_fwd_softmax_lse_correction(
     orig_mask = torch.isfinite(softmax_lse)
     step_mask = torch.isfinite(softmax_lse_per_step)
     new_scale = softmax_lse.clone()
-    new_scale[orig_mask & ~step_mask] = softmax_lse[orig_mask & (~step_mask)]
-    new_scale[~orig_mask & step_mask] = (softmax_lse_per_step[~orig_mask & step_mask]).to(
-        dtype=softmax_lse.dtype)
+    mask1 = orig_mask & (~step_mask)
+    new_scale = torch.where(mask1, softmax_lse, new_scale)
+    mask2 = ~orig_mask & step_mask
+    softmax_lse_per_step_casted = softmax_lse_per_step.to(dtype=softmax_lse.dtype)
+    new_scale = torch.where(mask2, softmax_lse_per_step_casted, new_scale)
     new_scale.masked_fill_(~orig_mask & ~step_mask, float("inf"))
 
     max_scale = torch.max(softmax_lse, softmax_lse_per_step)
     min_scale = torch.min(softmax_lse, softmax_lse_per_step)
     calculated_scale = max_scale + torch.log(1 + torch.exp(min_scale - max_scale))
-    new_scale[orig_mask & step_mask] = calculated_scale[orig_mask & step_mask]
+    mask3 = orig_mask & step_mask
+    new_scale = torch.where(mask3, calculated_scale, new_scale)
 
     softmax_lse.copy_(new_scale)
 
@@ -1788,6 +1791,7 @@ class AttnFuncWithCPAndKVP2P(torch.autograd.Function):
         cp_stream,
         attn_ranges_per_step,
         cu_seqlens_q_padded_cpu,
+        cu_seqlens_kv_padded_cpu,
     ):
         # pylint: disable=missing-function-docstring
         if softmax_scale is None:
@@ -1838,14 +1842,25 @@ class AttnFuncWithCPAndKVP2P(torch.autograd.Function):
         cu_seqlens_q_per_step = [None for _ in range(cp_size)]
         cu_seqlens_kv_per_step = [None for _ in range(cp_size)]
 
-        if cp_size_a2a > 1 and qkv_format == "thd" or attn_ranges_per_step is not None:
+        if qkv_format == "thd":
             if cu_seqlens_q_padded_cpu is None:
                 # fall back at the cost of extra sync
-                cu_seqlens_q_local_padded_cpu = (cu_seqlens_q_padded // cp_size_a2a).cpu()
+                cu_seqlens_q_padded_cpu = cu_seqlens_q_padded.cpu()
             else:
-                cu_seqlens_q_local_padded_cpu = cu_seqlens_q_padded_cpu // cp_size_a2a
-                assert not cu_seqlens_q_local_padded_cpu.is_cuda
+                cu_seqlens_q_padded_cpu = cu_seqlens_q_padded_cpu // cp_size
+            cu_seqlens_q_local_padded_cpu = cu_seqlens_q_padded_cpu // cp_size_a2a
+            assert not cu_seqlens_q_local_padded_cpu.is_cuda
+            if cu_seqlens_kv_padded_cpu is None:
+                # fall back at the cost of extra sync
+                cu_seqlens_kv_padded_cpu = cu_seqlens_kv_padded.cpu()
+            else:
+                cu_seqlens_kv_padded_cpu = cu_seqlens_kv_padded_cpu // cp_size
+            cu_seqlens_kv_local_padded_cpu = cu_seqlens_kv_padded_cpu // cp_size_a2a
+            assert not cu_seqlens_kv_local_padded_cpu.is_cuda
+            ctx.cu_seqlens_q_padded_cpu = cu_seqlens_q_padded_cpu
+            ctx.cu_seqlens_kv_padded_cpu = cu_seqlens_kv_padded_cpu
             ctx.cu_seqlens_q_local_padded_cpu = cu_seqlens_q_local_padded_cpu
+            ctx.cu_seqlens_kv_local_padded_cpu = cu_seqlens_kv_local_padded_cpu
 
         if attn_ranges_per_step is not None:
             assert len(attn_ranges_per_step) == cp_size
@@ -1952,7 +1967,7 @@ class AttnFuncWithCPAndKVP2P(torch.autograd.Function):
                 q, k, v = [x.view(2, x.shape[0] // 2, *x.shape[1:]) for x in [q, k, v]]
         total_tokens_kv = None if qkv_format != "thd" else k.shape[0]
         # remove padded tokens at the end
-        k, v = [x if qkv_format != "thd" else x[: cu_seqlens_kv_padded[-1]] for x in [k, v]]
+        k, v = [x if qkv_format != "thd" else x[: ctx.cu_seqlens_kv_padded_cpu[-1]] for x in [k, v]]
         if attn_bias is not None:
             assert len(attn_bias.shape) == 4, (
                 "Only support bias shape of [b, h, sq, sk] for forward, "
@@ -2021,8 +2036,8 @@ class AttnFuncWithCPAndKVP2P(torch.autograd.Function):
         send_recv_reqs = [[], []]
 
         if qkv_format == "thd":
-            local_total_q = cu_seqlens_q[-1].item() // cp_size
-            local_total_kv = cu_seqlens_kv[-1].item() // cp_size
+            local_total_q = ctx.cu_seqlens_q_padded_cpu[-1].item()
+            local_total_kv = ctx.cu_seqlens_kv_padded_cpu[-1].item()
 
         softmax_lse = None
         softmax_lse_ = None
@@ -4539,6 +4554,7 @@ def attn_forward_func_with_cp(
     fp8_meta=None,
     attn_ranges_per_step=None,
     cu_seqlens_q_padded_cpu=None,
+    cu_seqlens_kv_padded_cpu=None,
 ) -> torch.Tensor:
     """
     Attention implementation with context parallelism.
@@ -4615,7 +4631,7 @@ def attn_forward_func_with_cp(
     ]
 
     if cp_comm_type in ["p2p", "a2a+p2p"]:
-        args += [fp8, fp8_meta, cp_group, cp_global_ranks, cp_stream, attn_ranges_per_step, cu_seqlens_q_padded_cpu]
+        args += [fp8, fp8_meta, cp_group, cp_global_ranks, cp_stream, attn_ranges_per_step, cu_seqlens_q_padded_cpu, cu_seqlens_kv_padded_cpu]
         out = AttnFuncWithCPAndKVP2P.apply(*args)
     elif cp_comm_type == "all_gather":
         args.pop(5)
@@ -5497,6 +5513,7 @@ class FlashAttention(torch.nn.Module):
         fp8_meta: Optional[Dict[str, Any]] = None,
         attn_ranges_per_step: Optional[List[torch.Tensor]] = None,
         cu_seqlens_q_cpu: Optional[torch.Tensor] = None,
+        cu_seqlens_kv_cpu: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """flash-attn fprop"""
 
@@ -5651,6 +5668,7 @@ class FlashAttention(torch.nn.Module):
                     window_size=window_size,
                     attn_ranges_per_step=attn_ranges_per_step,
                     cu_seqlens_q_padded_cpu=cu_seqlens_q_cpu,
+                    cu_seqlens_kv_padded_cpu=cu_seqlens_kv_cpu,
                 )
         else:
 
@@ -7914,6 +7932,7 @@ class DotProductAttention(TransformerEngineBaseModule):
         is_first_microbatch: Optional[bool] = None,
         attn_ranges_per_step : Optional[List[torch.Tensor]] = None,
         cu_seqlens_q_cpu: Optional[torch.Tensor] = None,
+        cu_seqlens_kv_cpu: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Dot Product Attention Layer.
@@ -8469,6 +8488,7 @@ class DotProductAttention(TransformerEngineBaseModule):
                     fp8_meta=self.fp8_meta,
                     attn_ranges_per_step=attn_ranges_per_step,
                     cu_seqlens_q_cpu=cu_seqlens_q_cpu,
+                    cu_seqlens_kv_cpu=cu_seqlens_kv_cpu,
                 )
 
             if use_fused_attention:

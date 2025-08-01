@@ -151,9 +151,9 @@ else:
         )
         from flash_attn_2_cuda import varlen_bwd as flash_attn_cuda_bwd
 
-        from bblock.runtime.flash_attention.executor import (
-            _wrapped_flash_attn_varlen_forward_for_te as bblock_flash_attn_varlen_fwd,
-            _wrapped_flash_attn_varlen_backward_for_te as bblock_flash_attn_varlen_bwd
+        from dcp.runtime.flash_attention.executor import (
+            _wrapped_flash_attn_varlen_forward_for_te as dcp_flash_attn_varlen_fwd,
+            _wrapped_flash_attn_varlen_backward_for_te as dcp_flash_attn_varlen_bwd
         )
 
         _flash_attn_is_installed = True
@@ -2001,7 +2001,7 @@ class AttnFuncWithCPAndKVP2P(torch.autograd.Function):
                 fa_forward_kwargs["window_size"] = (-1, 0) if causal else (-1, -1)
             else:
                 if attn_ranges_per_step is not None:
-                    flash_attn_fwd = bblock_flash_attn_varlen_fwd
+                    flash_attn_fwd = dcp_flash_attn_varlen_fwd
                 else:
                     flash_attn_fwd = flash_attn_varlen_fwd
                     fa_forward_kwargs["dropout_p"] = dropout_p
@@ -2896,7 +2896,7 @@ class AttnFuncWithCPAndKVP2P(torch.autograd.Function):
                 fa_backward_kwargs["deterministic"] = ctx.deterministic
             else:
                 if attn_ranges_per_step is not None:
-                    flash_attn_bwd = bblock_flash_attn_varlen_bwd
+                    flash_attn_bwd = dcp_flash_attn_varlen_bwd
                 else:
                     flash_attn_bwd = flash_attn_varlen_bwd
                     fa_backward_kwargs["dropout_p"] = ctx.dropout_p

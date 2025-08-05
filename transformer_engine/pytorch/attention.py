@@ -7904,6 +7904,8 @@ class DotProductAttention(TransformerEngineBaseModule):
         inference_params: Optional[InferenceParams] = None,
         is_first_microbatch: Optional[bool] = None,
         attn_ranges_per_step : Optional[List[torch.Tensor]] = None,
+        cu_seqlens_q_cpu: Optional[torch.Tensor] = None,
+        cu_seqlens_kv_cpu: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Dot Product Attention Layer.
